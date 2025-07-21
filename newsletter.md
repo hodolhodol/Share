@@ -1,4 +1,9 @@
-# 📧 Dev. Center Knowledge / Asset / System  
+<!-- 타이틀 박스 시작 -->
+<div style="background-color: #000000; color: white; padding: 20px; width: 800px; margin: auto; text-align: center; font-size: 24px; font-weight: bold;">
+  Dev. Center Knowledge / Asset / System
+</div>
+<!-- 타이틀 박스 끝 -->
+
 *Newsletter — 2025.07.21*
 
 ---
