@@ -1,68 +1,56 @@
-<!-- 타이틀 박스 시작 -->
-<div style="background-color: #000000; color: white; padding: 20px; width: 800px; margin: auto; text-align: center; font-size: 24px; font-weight: bold;">
-  Dev. Center Knowledge / Asset / System
-</div>
-<!-- 타이틀 박스 끝 -->
+# 🧾 Newsletter Emoji Guide
 
-*Newsletter — 2025.07.21*
+This document summarizes the recommended emojis for use in newsletter headings, intros, outros, and sections such as references or contact.
 
 ---
 
-## 🗂️ 목차 (Table of Contents)
-1. [주제 1: 제목 예시](#주제-1-제목-예시)
-2. [주제 2: 제목 예시](#주제-2-제목-예시)
-3. [주제 3: 제목 예시](#주제-3-제목-예시)
+## 🧭 Heading Emoji Guide
+
+| Heading Level | Emoji | Meaning | Example |
+|---------------|--------|---------|---------|
+| H1            | 🧭     | Main title, overview | `# 🧭 Dev. Center Knowledge / Asset / System` |
+| H2            | 🔹     | Sub-topic, main section | `## 🔹 Topic 1: API Improvement` |
+| H3            | ▫️     | Detail, sub-section | `### ▫️ Key Fixes` |
 
 ---
 
-## 🧠 주제 1: 제목 예시
-**분류:** Knowledge / Asset / System  
-**작성자:** 홍길동  
-**관련 부서:** 서비스기획팀  
-**요약:**  
-> 이 부분에는 간단한 요약 또는 주요 내용을 한두 문장으로 작성합니다.
+## 👋 Intro & 🙏 Outro Emoji Guide
 
-**본문:**  
-- 상세 내용 1  
-- 상세 내용 2  
-- 참고 링크: [URL 또는 문서 링크]
+| Section  | Emoji | Meaning | Example |
+|----------|--------|---------|---------|
+| Intro    | 👋 / 📝 | Welcome, opening | `👋 Hello! Here’s what we’ve been working on:` |
+| Outro    | 🙏 / 📬 / 🔁 | Thanks, feedback, next issue | `🙏 Thanks for reading! 📬 Contact us:` |
 
 ---
 
-## 🧰 주제 2: 제목 예시
-**분류:** Knowledge / Asset / System  
-**작성자:** 김개발  
-**관련 부서:** 플랫폼개발팀  
-**요약:**  
-> 기술 스택, 적용 배경 또는 과제 해결 내용 등을 간략히 소개합니다.
+## ✅ Emoji for Examples and Tasks
 
-**본문:**  
-- 배경 설명  
-- 구현 방식 요약  
-- 운영상 이슈 및 개선 사항
+| Use Case | Emoji | Note |
+|----------|--------|------|
+| Example prefix | `Ex)` (not emoji) | Standard abbreviation |
+| Bullet/Task (done) | ☑️ / ✅ | Unicode emoji |
+| Bullet/Task (not done) | ⬛ / 🔲 | Use for unchecked look |
+| To-do list icon | 📌 | Emphasize a checklist section |
 
 ---
 
-## 🏗️ 주제 3: 제목 예시
-**분류:** Knowledge / Asset / System  
-**작성자:** 박엔지니어  
-**관련 부서:** 인프라팀  
-**요약:**  
-> 인프라/시스템 개선 또는 자동화 자산 공유 내용을 작성합니다.
+## 📚 Section Titles (for extra info)
 
-**본문:**  
-- 적용 시스템/서비스  
-- 기대 효과  
-- 향후 확산 계획
+| Section Title | Emoji | Use Case |
+|---------------|--------|----------|
+| Resources / References | 📚 / 🖇️ / 📘 | For links, docs, readings |
+| Archive & Contact | 🗂️ / 📬 / 📎 | Past issues + contact info |
+| Appendix | 📎 / 📋 | For footnotes or additions |
+| Feedback / Stay Connected | 🔁 / 💬 | Encourage reader engagement |
 
 ---
 
-### 📌 다음 뉴스레터에 다루었으면 하는 주제가 있다면 알려주세요!  
-내부 슬랙 채널 또는 이메일로 제보 바랍니다.
+## ✨ Tips
+
+- Use emojis only at the start of headings for clarity.
+- Keep usage consistent across newsletters.
+- Avoid overuse for a clean, professional tone.
 
 ---
 
-### 🖇️ 부록 (선택 사항)
-- 관련 문서: [예: Notion, Confluence 링크]  
-- 배포 일정: 매월 셋째 주 수요일  
-- 문의: dev.center@company.com
+For more emoji ideas, visit: [https://emojipedia.org](https://emojipedia.org) or use `Win + .` (Windows) or `Ctrl + Cmd + Space` (Mac).
