@@ -1,17 +1,255 @@
-프로그램 스니핏
+import requests
+import re
+import json
+import zlib
+import base64
+import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
+
+# =========================
+# 설정
+# =========================
+BASE_URL = "https://your-confluence.example.com/confluence"  # 뒤에 /confluence 없는 환경이면 제거
+AUTH = ("your_username_or_email", "your_api_token_or_password")
+HEADERS = {"Accept": "application/json"}
+
+# 일괄 치환 룰: 왼쪽을 오른쪽으로 모두 바꿉니다.
+REWRITE_MAP = {
+    "https://devops-qa.martindev.co.kr/confluence/x/fAAyQw": "https://devops-qa.martindev.co.kr/confluence/x/fgAyQw",
+    # 예) 도메인 이전:
+    # "https://old.example.com": "https://new.example.com",
+}
+
+# 처리할 페이지 ID들
+PAGE_IDS = [
+    # "123456",
+]
+
+# =========================
+# 유틸: 본문 정제/치환
+# =========================
+def sanitize_storage_format(html: str) -> str:
+    # Confluence PUT 파서가 싫어하는 요소 최소 정제
+    html = html.replace('\xa0', ' ')  # NBSP → space
+    # table 내부의 h1 같은 블록 요소는 위험. 시각 유지용 p 변환(필요 시 주석 해제)
+    html = re.sub(r'(<td[^>]*>)\s*<h1([^>]*)>(.*?)</h1>\s*(</td>)',
+                  r'\1<p\2 style="font-size:1.6em; font-weight:bold;">\3</p>\4', html, flags=re.DOTALL)
+    # draw.io 이미지 잔재(없어도 무방)
+    # html = re.sub(r'<ac:image[\s\S]*?</ac:image>', '', html)
+    return html
+
+def rewrite_urls_in_storage(html: str, mapping: dict) -> str:
+    # 단순 문자열 치환 + href/src 속성 타깃 정밀 치환
+    out = html
+    # 1) 안전한 정밀 치환: href/src 속성 값에 대해 매핑 적용
+    def repl_attr(m):
+        before = m.group(2)
+        after = mapping.get(before, before)
+        return f'{m.group(1)}"{after}"'
+
+    # href="...":, src="...":
+    out = re.sub(r'(href|src)\s*=\s*"([^"]+)"', repl_attr, out)
+
+    # 2) 원문 그대로 등장하는 URL도 치환 (표 안 텍스트 등)
+    for old, new in mapping.items():
+        out = out.replace(old, new)
+    return out
+
+# =========================
+# 유틸: draw.io(.drawio/.drawio.svg) 다루기
+# =========================
+def list_attachments(page_id: str):
+    # 모든 첨부 조회(페이지 크면 페이징 필요) — 간단히 size=500 가정
+    url = f"{BASE_URL}/rest/api/content/{page_id}/child/attachment?limit=500"
+    r = requests.get(url, headers=HEADERS, auth=AUTH)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
+def download_attachment(attachment_id: str):
+    # 다운로드 링크 얻기
+    url = f"{BASE_URL}/rest/api/content/{attachment_id}/download"
+    r = requests.get(url, headers=HEADERS, auth=AUTH, allow_redirects=True)
+    r.raise_for_status()
+    return r.content, r.headers.get("Content-Type", "")
+
+def upload_new_attachment_version(page_id: str, attachment_id: str, filename: str, data: bytes, content_type: str):
+    # 새 버전 업로드 (multipart)
+    url = f"{BASE_URL}/rest/api/content/{page_id}/child/attachment/{attachment_id}/data"
+    files = {
+        'file': (filename, data, content_type or 'application/octet-stream')
+    }
+    r = requests.post(url, headers={}, auth=AUTH, files=files)
+    r.raise_for_status()
+    return r.json()
+
+# ----- draw.io 디코딩/인코딩 -----
+def try_decompress_drawio_text(s: str) -> str:
+    """
+    <diagram> 텍스트가 종종 base64 + deflate 로 압축되어 있습니다.
+    압축된 경우 풀어서 XML(Text)로, 아니면 원문 반환.
+    """
+    try:
+        raw = base64.b64decode(s)
+        # -15: raw DEFLATE (zlib 헤더 없음)
+        xml = zlib.decompress(raw, -15).decode('utf-8', errors='replace')
+        return xml
+    except Exception:
+        return s  # 압축 안된 평문일 가능성
+
+def compress_drawio_text(s: str) -> str:
+    """
+    편집한 평문 XML을 다시 deflate + base64로 압축.
+    """
+    comp = zlib.compress(s.encode('utf-8'))  # zlib 헤더 포함
+    # draw.io는 raw deflate(-15) + base64를 주로 사용. zlib 헤더 제거 필요.
+    # zlib 포맷: 2바이트 헤더 + ... + 4바이트 Adler-32
+    # 간단하게 raw deflate로 재압축:
+    comp_raw = zlib.compressobj(level=9, wbits=-15)
+    data = comp_raw.compress(s.encode('utf-8')) + comp_raw.flush()
+    return base64.b64encode(data).decode('ascii')
+
+def rewrite_urls_in_drawio_xml(xml_text: str, mapping: dict) -> str:
+    """
+    draw.io 평문 XML(mxl, mxfile 내부) 내 URL 문자열 치환.
+    링크는 보통 mxCell/@link 또는 userObject/@link, 또는 style 내 'link=' 형태로 존재.
+    """
+    # 1) 속성 치환: link, url, href 등
+    def repl_attr_value(match):
+        before = match.group(2)
+        after = mapping.get(before, before)
+        return f'{match.group(1)}="{after}"'
+
+    out = re.sub(r'(link|url|href)\s*=\s*"([^"]+)"', repl_attr_value, xml_text)
+
+    # 2) 스타일 문자열 내 link=...
+    def repl_style_link(m):
+        style = m.group(0)
+        for old, new in mapping.items():
+            style = style.replace(f"link={old}", f"link={new}")
+        return style
+    out = re.sub(r'style="[^"]+"', repl_style_link, out)
+
+    # 3) 텍스트 노드에 순수 URL이 있을 수도 있음
+    for old, new in mapping.items():
+        out = out.replace(old, new)
+
+    return out
+
+def process_drawio_attachment(page_id: str, att: dict, mapping: dict):
+    filename = att.get("title") or att.get("metadata", {}).get("filename")
+    if not filename:
+        return False, "no-filename"
+
+    name = filename.lower()
+    if not (name.endswith(".drawio") or name.endswith(".drawio.svg")):
+        return False, "skip-non-drawio"
+
+    attachment_id = att["id"]
+    data, ctype = download_attachment(attachment_id)
+
+    text = None
+    if name.endswith(".drawio"):
+        # XML 텍스트
+        text = data.decode('utf-8', errors='replace')
+        # <mxfile><diagram>...</diagram></mxfile> 형태. diagram 텍스트가 압축일 수 있음
+        try:
+            root = ET.fromstring(text)
+        except Exception as e:
+            return False, f"xml-parse-failed: {e}"
+
+        changed = False
+        for diag in root.findall(".//diagram"):
+            payload = diag.text or ""
+            plain = try_decompress_drawio_text(payload)
+            new_plain = rewrite_urls_in_drawio_xml(plain, mapping)
+            if new_plain != plain:
+                changed = True
+                # 재압축 결정: 원본이 압축이었다면 압축으로, 아니면 평문으로
+                if payload.strip() and payload.strip() != plain.strip():
+                    # 원본이 압축이었던 것으로 간주 → 재압축
+                    diag.text = compress_drawio_text(new_plain)
+                else:
+                    diag.text = new_plain
+
+        if not changed:
+            return False, "no-change"
+
+        new_bytes = ET.tostring(root, encoding="utf-8", method="xml")
+        upload_new_attachment_version(page_id, attachment_id, filename, new_bytes, "application/xml")
+        return True, "updated"
+
+    elif name.endswith(".drawio.svg"):
+        # SVG는 XML이므로 텍스트 치환 시도
+        text = data.decode('utf-8', errors='replace')
+        new_text = rewrite_urls_in_drawio_xml(text, mapping)
+        if new_text == text:
+            return False, "no-change"
+        new_bytes = new_text.encode('utf-8')
+        upload_new_attachment_version(page_id, attachment_id, filename, new_bytes, "image/svg+xml")
+        return True, "updated"
+
+    return False, "unknown-case"
+
+# =========================
+# 페이지 본문 GET/PUT
+# =========================
+def get_page(pid: str):
     url = f"{BASE_URL}/rest/api/content/{pid}?expand=body.storage,version"
-    res = requests.get(url, headers=headers)
-    if res.status_code != 200:
-        print(f"❌ Failed to get {title}")
-        return
+    r = requests.get(url, headers=HEADERS, auth=AUTH)
+    r.raise_for_status()
+    return r.json()
 
-    data = res.json()
-    body = data['body']['storage']['value']
-    version = data['version']['number']
+def put_page(pid: str, title: str, version: int, storage_value: str):
+    payload = {
+        "id": pid,
+        "type": "page",
+        "title": title,
+        "version": {"number": version + 1},
+        "body": {"storage": {"value": storage_value, "representation": "storage"}}
+    }
+    url = f"{BASE_URL}/rest/api/content/{pid}"
+    r = requests.put(url, headers={"Content-Type": "application/json"}, auth=AUTH, data=json.dumps(payload, ensure_ascii=False))
+    if r.status_code != 200:
+        raise Exception(f"PUT failed {r.status_code}: {r.text[:500]}")
+    return r.json()
 
-원본
-'<ul><li>Link\xa0 종류 4가지<ol><li>\xa0search : MARTIN 개발센터 지식 공유……………AI-powered…AI Code Assistant</li><li>page id : <a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698" class="">https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698</a></li><li>space key + page name : <a href="https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing" class="">https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing</a></li><li>short cut \xa0: <a href="https://devops.martindev.co.kr/confluence/x/4QlhT" class="">https://devops.martindev.co.kr/confluence/x/4QlhT</a></li></ol></li><li>Page\xa0 유형 2가지<ol><li>일반 페이지</li><li>draw.io</li></ol></li></ul><p><br /></p><p><br /></p><table class="wrapped"><colgroup><col /><col /><col /><col /><col /></colgroup><tbody><tr><th scope="col"><br /></th><th scope="col"><br /></th><th scope="col">Link 형식</th><th scope="col"><br /></th><th scope="col">비고</th></tr><tr><td><br /></td><td>단순 page - Search</td><td>MARTIN 개발센터 지식 공유……………AI-powered…AI Code Assistant</td><td><h1 class="with-breadcrumbs"><a href="https://devops.martindev.co.kr/confluence/display/Knowledge/Tech+Radar+A-Z" style="text-decoration: none;">Tech Radar A-Z</a></h1></td><td><div class="content-wrapper"><p><br /></p><h1 class="with-breadcrumbs"><ac:image ac:height="400"><ri:attachment ri:filename="image-2025-7-30_13-51-51.png" /></ac:image></h1><p><br /></p></div></td></tr><tr><td><br /></td><td><p>draw.io</p><p>\xa0- page id</p><ul style="list-style-type: square;"><li>space key + page name</li></ul></td><td><p><a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698" name="url" style="text-decoration: none;">/pages/viewpage.action?pageId=490856698</a></p><p>(<a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698">https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698</a>)</p><p><a name="url" href="https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing" style="text-decoration: none;">https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Comp</a>uting</p><p>(<a href="https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing">https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing</a>)</p></td><td><h1 class="with-breadcrumbs"><a href="https://devops.martindev.co.kr/confluence/pages/viewpage.action?pageId=1654233884">▶Tech Stack View</a></h1></td><td><div class="content-wrapper"><p><ac:image ac:height="400"><ri:attachment ri:filename="image-2025-7-30_13-53-52.png" /></ac:image></p></div></td></tr><tr><td><br /></td><td><p>draw.io - pageId</p><p>(컨플루언스 URL 이 없는데...)</p></td><td><p><a name="url" style="text-decoration: none;" href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=759681145">/pages/viewpage.action?pageId=759681145</a><br /><span class="nolink">(<a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=759681145)">https://devops.martindev.co.kr/pages/viewpage.action?pageId=759681145)</a></span></p><p><br /></p></td><td><h1 class="with-breadcrumbs"><a style="text-decoration: none;" href="https://devops.martindev.co.kr/confluence/display/Knowledge/MARTIN+Scaled+Agile+Framework">MARTIN Scaled Agile Framework</a></h1></td><td><div class="content-wrapper"><p><br /></p></div></td></tr><tr><td><br /></td><td><p><s>단순 page-search</s></p><p><s>(중복)</s></p></td><td>MARTIN 개발센터 지식 공유PagesMARTIN 개발센터 지식 공유 HomeTech RadarTech Radar v24Technique &amp; PatternAI-powered SW EngineeringAI Code Assistant</td><td><h1 class="with-breadcrumbs"><a href="https://devops.martindev.co.kr/confluence/display/Knowledge/AI-powered+SW+Engineering">AI-powered SW Engineering</a></h1></td><td><div class="content-wrapper"><p><ac:image ac:height="400"><ri:attachment ri:filename="image-2025-7-30_14-8-4.png" /></ac:image></p></div></td></tr><tr><td><br /></td><td>shortcut</td><td><p style="text-align: left;"><a href="https://devops-qa.martindev.co.kr/confluence/x/fAAyQw" style="" class="" rel="nofollow">https://devops-qa.martindev.co.kr/confluence/x/fAAyQw</a></p><p style="text-align: left;"><br /></p><p style="text-align: left;">이걸 가리키면 됨.<span>\xa0</span><a href="https://devops-qa.martindev.co.kr/confluence/display/ARU/Tiny+Url+Test" style="">Tiny Url Test</a></p></td><td><h1 class="with-breadcrumbs" style=""><a style="" href="https://devops-qa.martindev.co.kr/confluence/display/TPG/Tiny+Url+Test">Tiny Url Test</a></h1></td><td><br /></td></tr></tbody></table>'
+# =========================
+# 메인 로직
+# =========================
+def process_page(pid: str, mapping: dict):
+    print(f"\n=== Page {pid} ===")
+    page = get_page(pid)
+    title = page["title"]
+    version = page["version"]["number"]
+    storage = page["body"]["storage"]["value"]
 
-변경
-('<ul><li>Link\xa0 종류 4가지<ol><li>\xa0search : MARTIN 개발센터 지식 공유……………AI-powered…AI Code Assistant</li><li>page id : <a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698" class="">https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698</a></li><li>space key + page name : <a href="https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing" class="">https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing</a></li><li>short cut \xa0: <a href="https://devops.martindev.co.kr/confluence/x/4QlhT" class="">https://devops.martindev.co.kr/confluence/x/4QlhT</a></li></ol></li><li>Page\xa0 유형 2가지<ol><li>일반 페이지</li><li>draw.io</li></ol></li></ul><p><br /></p><p><br /></p><table class="wrapped"><colgroup><col /><col /><col /><col /><col /></colgroup><tbody><tr><th scope="col"><br /></th><th scope="col"><br /></th><th scope="col">Link 형식</th><th scope="col"><br /></th><th scope="col">비고</th></tr><tr><td><br /></td><td>단순 page - Search</td><td>MARTIN 개발센터 지식 공유……………AI-powered…AI Code Assistant</td><td><h1 class="with-breadcrumbs"><a href="https://devops.martindev.co.kr/confluence/display/Knowledge/Tech+Radar+A-Z" style="text-decoration: none;">Tech Radar A-Z</a></h1></td><td><div class="content-wrapper"><p><br /></p><h1 class="with-breadcrumbs"><ac:image ac:height="400"><ri:attachment ri:filename="image-2025-7-30_13-51-51.png" /></ac:image></h1><p><br /></p></div></td></tr><tr><td><br /></td><td><p>draw.io</p><p>\xa0- page id</p><ul style="list-style-type: square;"><li>space key + page name</li></ul></td><td><p><a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698" name="url" style="text-decoration: none;">/pages/viewpage.action?pageId=490856698</a></p><p>(<a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698">https://devops.martindev.co.kr/pages/viewpage.action?pageId=490856698</a>)</p><p><a name="url" href="https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing" style="text-decoration: none;">https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Comp</a>uting</p><p>(<a href="https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing">https://devops.martindev.co.kr/confluence/display/TR/Cloud+Native+Computing</a>)</p></td><td><h1 class="with-breadcrumbs"><a href="https://devops.martindev.co.kr/confluence/pages/viewpage.action?pageId=1654233884">▶Tech Stack View</a></h1></td><td><div class="content-wrapper"><p><ac:image ac:height="400"><ri:attachment ri:filename="image-2025-7-30_13-53-52.png" /></ac:image></p></div></td></tr><tr><td><br /></td><td><p>draw.io - pageId</p><p>(컨플루언스 URL 이 없는데...)</p></td><td><p><a name="url" style="text-decoration: none;" href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=759681145">/pages/viewpage.action?pageId=759681145</a><br /><span class="nolink">(<a href="https://devops.martindev.co.kr/pages/viewpage.action?pageId=759681145)">https://devops.martindev.co.kr/pages/viewpage.action?pageId=759681145)</a></span></p><p><br /></p></td><td><h1 class="with-breadcrumbs"><a style="text-decoration: none;" href="https://devops.martindev.co.kr/confluence/display/Knowledge/MARTIN+Scaled+Agile+Framework">MARTIN Scaled Agile Framework</a></h1></td><td><div class="content-wrapper"><p><br /></p></div></td></tr><tr><td><br /></td><td><p><s>단순 page-search</s></p><p><s>(중복)</s></p></td><td>MARTIN 개발센터 지식 공유PagesMARTIN 개발센터 지식 공유 HomeTech RadarTech Radar v24Technique & PatternAI-powered SW EngineeringAI Code Assistant</td><td><h1 class="with-breadcrumbs"><a href="https://devops.martindev.co.kr/confluence/display/Knowledge/AI-powered+SW+Engineering">AI-powered SW Engineering</a></h1></td><td><div class="content-wrapper"><p><ac:image ac:height="400"><ri:attachment ri:filename="image-2025-7-30_14-8-4.png" /></ac:image></p></div></td></tr><tr><td><br /></td><td>shortcut</td><td><p style="text-align: left;"><a href="https://devops-qa.martindev.co.kr/confluence/x/fAAyQw" style="" class="" rel="nofollow">https://devops-qa.martindev.co.kr/confluence/x/fAAyQw</a></p><p style="text-align: left;"><br /></p><p style="text-align: left;">이걸 가리키면 됨.<span>\xa0</span><a href="https://devops-qa.martindev.co.kr/confluence/display/ARU/Tiny+Url+Test" style="">Tiny Url Test</a></p></td><td><h1 class="with-breadcrumbs" style=""><a style="" href="https://devops-qa.martindev.co.kr/confluence/display/TPG/Tiny+Url+Test">Tiny Url Test</a></h1></td><td><br /></td></tr></tbody></table>', {'https://devops-qa.martindev.co.kr/confluence/x/fAAyQw': 'https://devops-qa.martindev.co.kr/confluence/x/fgAyQw'})
+    # 1) draw.io 첨부 처리 (선수처리 권장: 본문 링크만 바꿔도 되지만, 첨부 내부 링크가 더 중요할 때가 많음)
+    atts = list_attachments(pid)
+    updated_any_diagram = False
+    for att in atts:
+        ok, msg = process_drawio_attachment(pid, att, mapping)
+        print(f" - attachment {att.get('title') or att.get('id')} -> {msg}")
+        if ok:
+            updated_any_diagram = True
 
+    # 2) 본문 링크 치환 + 정제 후 PUT
+    new_storage = rewrite_urls_in_storage(storage, mapping)
+    new_storage = sanitize_storage_format(new_storage)
+
+    if new_storage != storage:
+        try:
+            put_page(pid, title, version, new_storage)
+            print(" - page body: updated")
+        except Exception as e:
+            print(f" - page body: PUT failed: {e}")
+    else:
+        print(" - page body: no-change")
+
+    return True
+
+if __name__ == "__main__":
+    for pid in PAGE_IDS:
+        try:
+            process_page(pid, REWRITE_MAP)
+        except Exception as e:
+            print(f"[ERROR] page {pid}: {e}")
