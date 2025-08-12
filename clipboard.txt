@@ -1,255 +1,327 @@
-import requests
-import re
-import json
-import zlib
-import base64
-import xml.etree.ElementTree as ET
-from urllib.parse import urlparse
+# 일반 링크 변경 + 짧은 URL 수집
 
-# =========================
+import requests, re, csv, time, certifi, urllib.parse, json
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from drawio_utils import replace_links_drawio
+import os
 # 설정
-# =========================
-BASE_URL = "https://your-confluence.example.com/confluence"  # 뒤에 /confluence 없는 환경이면 제거
-AUTH = ("your_username_or_email", "your_api_token_or_password")
-HEADERS = {"Accept": "application/json"}
+#설정 - 검증서버
+load_dotenv()
 
-# 일괄 치환 룰: 왼쪽을 오른쪽으로 모두 바꿉니다.
-REWRITE_MAP = {
-    "https://devops-qa.martindev.co.kr/confluence/x/fAAyQw": "https://devops-qa.martindev.co.kr/confluence/x/fgAyQw",
-    # 예) 도메인 이전:
-    # "https://old.example.com": "https://new.example.com",
+EMAIL = os.getenv("EMAIL")
+API_TOKEN = os.getenv("API_TOKEN")
+
+
+BASE_URL = "https://devops-qa.martin.co.kr/confluence"   # 또는 내부 도메인
+PAGE_ID = "823654206"  # 테스트할 Confluence 페이지 ID
+CERT_PATH = "..."
+ROOT_PAGE_ID = "1066435477"  # 테스트할 Confluence 페이지 ID
+
+# ORIGIN_SPACES = ['TR', 'AGILEK', 'DCO']
+# TARGET_SPACE = 'Knowledge'
+ORIGIN_SPACES = ['TR', 'AGILEK', 'DCO']
+TARGET_SPACE = 'ARU'
+
+TESTPAGE = 'TESTPAGE'
+
+auth = (EMAIL, API_TOKEN)
+headers = {
+    "Authorization": f"Bearer {API_TOKEN}",  # Bearer 토큰 방식으로 인증
+   "Content-Type": "application/json",
+#    "Accept": "application/json"
 }
 
-# 처리할 페이지 ID들
-PAGE_IDS = [
-    # "123456",
-]
+short_urls = {}
+pageid_urls = {}
 
-# =========================
-# 유틸: 본문 정제/치환
-# =========================
-def sanitize_storage_format(html: str) -> str:
-    # Confluence PUT 파서가 싫어하는 요소 최소 정제
-    html = html.replace('\xa0', ' ')  # NBSP → space
-    # table 내부의 h1 같은 블록 요소는 위험. 시각 유지용 p 변환(필요 시 주석 해제)
-    html = re.sub(r'(<td[^>]*>)\s*<h1([^>]*)>(.*?)</h1>\s*(</td>)',
-                  r'\1<p\2 style="font-size:1.6em; font-weight:bold;">\3</p>\4', html, flags=re.DOTALL)
-    # draw.io 이미지 잔재(없어도 무방)
-    # html = re.sub(r'<ac:image[\s\S]*?</ac:image>', '', html)
-    return html
 
-def rewrite_urls_in_storage(html: str, mapping: dict) -> str:
-    # 단순 문자열 치환 + href/src 속성 타깃 정밀 치환
-    out = html
-    # 1) 안전한 정밀 치환: href/src 속성 값에 대해 매핑 적용
-    def repl_attr(m):
-        before = m.group(2)
-        after = mapping.get(before, before)
-        return f'{m.group(1)}"{after}"'
 
-    # href="...":, src="...":
-    out = re.sub(r'(href|src)\s*=\s*"([^"]+)"', repl_attr, out)
+def get_all_page_ids(space_key):
+    ids = []
+    start = 0
+    while True:
+        url = f"{BASE_URL}/rest/api/content?spaceKey={space_key}&limit=50&start={start}&expand=version"
+        res = requests.get(url, headers=headers)
+        results = res.json().get("results", [])
+        if not results: break
+        for page in results:
+            ids.append((page['id'], page['title']))
+        start += 50
+    return ids
+def get_child_pages(parent_id):
+    """지정한 페이지 ID 이하의 모든 하위 페이지 ID+제목 리스트 반환"""
+    pages = []
+    stack = [parent_id]
 
-    # 2) 원문 그대로 등장하는 URL도 치환 (표 안 텍스트 등)
-    for old, new in mapping.items():
-        out = out.replace(old, new)
-    return out
+    while stack:
+        current_id = stack.pop()
+        url = f"{BASE_URL}/rest/api/content/{current_id}?expand=children.page"
+        #res = requests.get(url, auth=auth)
+        res = requests.get(url, headers=headers)
+        if res.status_code != 200:
+            print(f"❌ Failed to get children of {current_id}")
+            continue
 
-# =========================
-# 유틸: draw.io(.drawio/.drawio.svg) 다루기
-# =========================
-def list_attachments(page_id: str):
-    # 모든 첨부 조회(페이지 크면 페이징 필요) — 간단히 size=500 가정
-    url = f"{BASE_URL}/rest/api/content/{page_id}/child/attachment?limit=500"
-    r = requests.get(url, headers=HEADERS, auth=AUTH)
-    r.raise_for_status()
-    return r.json().get("results", [])
+        data = res.json()
+        title = data.get("title", "Untitled")
+        pages.append((current_id, title))
 
-def download_attachment(attachment_id: str):
-    # 다운로드 링크 얻기
-    url = f"{BASE_URL}/rest/api/content/{attachment_id}/download"
-    r = requests.get(url, headers=HEADERS, auth=AUTH, allow_redirects=True)
-    r.raise_for_status()
-    return r.content, r.headers.get("Content-Type", "")
+        children = data.get("children", {}).get("page", {}).get("results", [])
+        for child in children:
+            stack.append(child["id"])
+    return pages
+  
+def replace_links_spacekey(body):
+    for space in ORIGIN_SPACES:
+        #body = re.sub(rf'{BASE_URL}/display/{space}/', f'{BASE_URL}/display/{TARGET_SPACE}/', body)
+        body = re.sub(rf'{BASE_URL}/display/{space}/', f'{BASE_URL}/display/{TARGET_SPACE}/', body)         
+        body = re.sub(rf'/display/{space}/', f'{BASE_URL}/display/{TARGET_SPACE}/', body)   
+        
 
-def upload_new_attachment_version(page_id: str, attachment_id: str, filename: str, data: bytes, content_type: str):
-    # 새 버전 업로드 (multipart)
-    url = f"{BASE_URL}/rest/api/content/{page_id}/child/attachment/{attachment_id}/data"
-    files = {
-        'file': (filename, data, content_type or 'application/octet-stream')
+        body = re.sub(rf'/spaces/{space}/pages/', f'/spaces/{TARGET_SPACE}/pages/', body)
+        body = re.sub(rf'https://[^"]+/wiki/display/{space}/', f'/display/{TARGET_SPACE}/', body)
+        body = re.sub(rf'https://[^"]+/wiki/spaces/{space}/pages/', f'/spaces/{TARGET_SPACE}/pages/', body)
+        body = re.sub(rf'link="[^"]*/spaces/{space}/pages/', lambda m: m.group(0).replace(f'/spaces/{space}/', f'/spaces/{TARGET_SPACE}/'), body)
+    return body
+
+def replace_links_tinyui(body, title, page_id):
+    matches = re.findall(rf'{BASE_URL}/x/[a-zA-Z0-9]+', body)
+    for m in matches:
+        partial = "".join(m)
+        short_url = f"{BASE_URL}{partial}" if partial.startswith('/x') or '/wiki/x' in partial else partial
+        if short_url not in short_urls:
+            new_url = get_new_short_url(short_url, TARGET_SPACE)
+            short_urls[short_url] = new_url
+            body = re.sub(short_url, new_url, body)
+            print(f"🔗 Replaced {short_url} with {new_url}")
+
+        # else:
+        #     print(f"❌ 이 short url은 수정되었어야 함 {short_url}")
+        #    continue
+    
+    return body
+
+def replace_links_page_id(body):
+    matches = re.findall(rf'{BASE_URL}/pages/viewpage\.action\?pageId=\d+', body)
+    for m in matches:
+        page_id = extract_page_id(m)
+        if page_id in pageid_urls:
+            continue
+#        if page_id == pageid_urls[page_id] : continue #page_id 동일하면 space가 origin_space에 있던게 아니다. 즉, 변경할 필요가 없다.
+        page_info = get_page_info_by_id(page_id)
+        if page_info is None:
+            print(f"❌ Page not found: {page_id}")
+            continue
+        space = page_info['_expandable']['space'].strip('/').split('/')[-1] #space path의 맨마지막 가지고 옴
+        title = page_info['title']
+        if space in ORIGIN_SPACES:
+                target_page_info = get_page_info_by_title(TARGET_SPACE, title)
+                if target_page_info:
+                    target_page_id = target_page_info.get('id')
+                    old_url = m
+                    new_url = f"{BASE_URL}/pages/viewpage.action?pageId={target_page_id}"
+                    body = body.replace(old_url, new_url)
+                    print(f"🔗 Replaced {old_url} with {new_url}")
+                    pageid_urls[page_id] = target_page_id
+        else :
+            pageid_urls[page_id] = page_id #page_id 동일하면 space가 origin_space에 있던게 아니다. 즉, 변경할 필요가 없다.
+
+    return body
+
+
+def resolve_short_url_to_title(short_url):
+    """
+    short URL을 풀어서 page ID 반환
+    :param short_url: e.g. https://your-domain.atlassian.net/x/AbCdE
+    :param auth: requests basic auth tuple (username, API token)
+    """
+    response = requests.get(short_url, headers=headers, allow_redirects=True)
+    
+    # 최종 리디렉션 URL에서 page ID 추출
+    title = response.url.split('/')[-1].replace('+', ' ') # url에서는 스페이스가 +로 나와서.
+    return title
+    
+    return title
+
+    
+def resolve_tiny_url(short_url):
+    response = requests.get(short_url, allow_redirects=False, headers=headers)
+    if response.status_code in [301, 302]:
+        return response.headers['Location']
+    else:
+        raise Exception(f"리디렉션 실패: status code {response.status_code}")
+
+# 2. URL에서 page ID 추출 (e.g. /pages/viewpage.action?pageId=12345678)
+def extract_page_id(full_url):
+    match = re.search(r"pageId=(\d+)", full_url)
+    if match:
+        return match.group(1)
+    else:
+        raise Exception(f"pageId를 찾을 수 없습니다: {full_url}")
+    
+def get_page_info_by_id(page_id):
+    """
+    page ID로 title 등 페이지 정보 조회
+    """
+    url = f"{BASE_URL}/rest/api/content/{page_id}"
+    params = {"expand": "title"}
+    response = requests.get(url, headers=headers, params=params)
+    response.raise_for_status()
+    return response.json()
+    
+
+
+def get_short_url_by_title(title, space_key, base_url):
+    """
+    주어진 title로 페이지를 검색하고 short URL(tiny link)을 반환
+    """
+    # 1. 제목으로 페이지 조회
+    url = f"{base_url}/rest/api/search"
+    params = {
+        "title": title,
+        "space": space_key,
+        "expand": "version"  # title 존재 유무 확인용
     }
-    r = requests.post(url, headers={}, auth=AUTH, files=files)
-    r.raise_for_status()
-    return r.json()
+    resp = requests.get(url, headers=headers, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    
+    # 2. 결과 없을 경우 처리
+    if not data.get("results"):
+        print("Martin", "get_short_url_by_title", "해당 페이지 없음 {title}")
+        return None  # or raise Exception("Page not found")
+    
+    page = data["results"][0]
+    page_id = page["id"]
+    
+    # 3. 페이지 ID로 tiny link 정보 가져오기
+    url = f"{base_url}/rest/api/content/{page_id}?expand=shortUrl,tinyui"
+    resp = requests.get(url, auth=auth)
+    resp.raise_for_status()
+    page_data = resp.json()
 
-# ----- draw.io 디코딩/인코딩 -----
-def try_decompress_drawio_text(s: str) -> str:
+    # 4. shortUrl 필드가 존재할 경우 반환
+    tiny_url = page_data.get("tinyui", {}).get("link")
+    if tiny_url:
+        return f"{base_url}{tiny_url}"
+    else:
+        return None
+    
+def url_encode_query(query_string):
     """
-    <diagram> 텍스트가 종종 base64 + deflate 로 압축되어 있습니다.
-    압축된 경우 풀어서 XML(Text)로, 아니면 원문 반환.
+    Encodes the given query string for use in a URL.
+
+    Args:
+    query_string (str): The query string to encode.
+
+    Returns:
+    str: The URL-encoded query string.
     """
-    try:
-        raw = base64.b64decode(s)
-        # -15: raw DEFLATE (zlib 헤더 없음)
-        xml = zlib.decompress(raw, -15).decode('utf-8', errors='replace')
-        return xml
-    except Exception:
-        return s  # 압축 안된 평문일 가능성
+    return urllib.parse.quote_plus(query_string)
 
-def compress_drawio_text(s: str) -> str:
-    """
-    편집한 평문 XML을 다시 deflate + base64로 압축.
-    """
-    comp = zlib.compress(s.encode('utf-8'))  # zlib 헤더 포함
-    # draw.io는 raw deflate(-15) + base64를 주로 사용. zlib 헤더 제거 필요.
-    # zlib 포맷: 2바이트 헤더 + ... + 4바이트 Adler-32
-    # 간단하게 raw deflate로 재압축:
-    comp_raw = zlib.compressobj(level=9, wbits=-15)
-    data = comp_raw.compress(s.encode('utf-8')) + comp_raw.flush()
-    return base64.b64encode(data).decode('ascii')
+def get_page_info_by_title(space_key, title):
+    url = f"{BASE_URL}/rest/api/search"
+    params = {
+        'cql': f'title="{title}" AND space="{space_key}"',
+        'limit': 10
+    }
+    
+    response = requests.get(url, headers=headers, params=params)
 
-def rewrite_urls_in_drawio_xml(xml_text: str, mapping: dict) -> str:
-    """
-    draw.io 평문 XML(mxl, mxfile 내부) 내 URL 문자열 치환.
-    링크는 보통 mxCell/@link 또는 userObject/@link, 또는 style 내 'link=' 형태로 존재.
-    """
-    # 1) 속성 치환: link, url, href 등
-    def repl_attr_value(match):
-        before = match.group(2)
-        after = mapping.get(before, before)
-        return f'{match.group(1)}="{after}"'
+    if response.status_code != 200:
+        raise Exception(f"Request failed with status code {response.status_code}")
+    
+    data = response.json()
+    results = data.get('results', [])
+    
+    if not results:
+        return None
+    
+    for result in results:
+        if result.get('title') == title:
+            return {
+                "id" :  result['content']['id'],
+                "title" :  result['content']['title'],
+                "webui" :  result['content']['_links']['webui'],
+                "tinyui" :  result['content']['_links']['tinyui']
+            }
+    return None
 
-    out = re.sub(r'(link|url|href)\s*=\s*"([^"]+)"', repl_attr_value, xml_text)
 
-    # 2) 스타일 문자열 내 link=...
-    def repl_style_link(m):
-        style = m.group(0)
-        for old, new in mapping.items():
-            style = style.replace(f"link={old}", f"link={new}")
-        return style
-    out = re.sub(r'style="[^"]+"', repl_style_link, out)
+def get_new_short_url(short_url, new_space):
+    # Step 1: Extract the page ID from the short URL
+    title = resolve_short_url_to_title(short_url)
+    new_short_url = get_page_info_by_title(TARGET_SPACE, title)['tinyui']   
 
-    # 3) 텍스트 노드에 순수 URL이 있을 수도 있음
-    for old, new in mapping.items():
-        out = out.replace(old, new)
+    if new_short_url:
+        return f"{BASE_URL}{new_short_url}"
+    else:
+        return None
+        
 
-    return out
-
-def process_drawio_attachment(page_id: str, att: dict, mapping: dict):
-    filename = att.get("title") or att.get("metadata", {}).get("filename")
-    if not filename:
-        return False, "no-filename"
-
-    name = filename.lower()
-    if not (name.endswith(".drawio") or name.endswith(".drawio.svg")):
-        return False, "skip-non-drawio"
-
-    attachment_id = att["id"]
-    data, ctype = download_attachment(attachment_id)
-
-    text = None
-    if name.endswith(".drawio"):
-        # XML 텍스트
-        text = data.decode('utf-8', errors='replace')
-        # <mxfile><diagram>...</diagram></mxfile> 형태. diagram 텍스트가 압축일 수 있음
-        try:
-            root = ET.fromstring(text)
-        except Exception as e:
-            return False, f"xml-parse-failed: {e}"
-
-        changed = False
-        for diag in root.findall(".//diagram"):
-            payload = diag.text or ""
-            plain = try_decompress_drawio_text(payload)
-            new_plain = rewrite_urls_in_drawio_xml(plain, mapping)
-            if new_plain != plain:
-                changed = True
-                # 재압축 결정: 원본이 압축이었다면 압축으로, 아니면 평문으로
-                if payload.strip() and payload.strip() != plain.strip():
-                    # 원본이 압축이었던 것으로 간주 → 재압축
-                    diag.text = compress_drawio_text(new_plain)
-                else:
-                    diag.text = new_plain
-
-        if not changed:
-            return False, "no-change"
-
-        new_bytes = ET.tostring(root, encoding="utf-8", method="xml")
-        upload_new_attachment_version(page_id, attachment_id, filename, new_bytes, "application/xml")
-        return True, "updated"
-
-    elif name.endswith(".drawio.svg"):
-        # SVG는 XML이므로 텍스트 치환 시도
-        text = data.decode('utf-8', errors='replace')
-        new_text = rewrite_urls_in_drawio_xml(text, mapping)
-        if new_text == text:
-            return False, "no-change"
-        new_bytes = new_text.encode('utf-8')
-        upload_new_attachment_version(page_id, attachment_id, filename, new_bytes, "image/svg+xml")
-        return True, "updated"
-
-    return False, "unknown-case"
-
-# =========================
-# 페이지 본문 GET/PUT
-# =========================
-def get_page(pid: str):
+def update_page(pid, title):
     url = f"{BASE_URL}/rest/api/content/{pid}?expand=body.storage,version"
-    r = requests.get(url, headers=HEADERS, auth=AUTH)
-    r.raise_for_status()
-    return r.json()
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        print(f"❌ Failed to get {title}")
+        return
 
-def put_page(pid: str, title: str, version: int, storage_value: str):
+    data = res.json()
+    body = data['body']['storage']['value']
+    version = data['version']['number']
+    
+    new_body = replace_links_spacekey(body)
+    new_body = replace_links_tinyui(new_body, title, pid)
+    new_body = replace_links_page_id(new_body)
+    new_body = replace_links_drawio(newbody, data)
+    if new_body == body:
+        print(f"🔍 No change: {title}")
+        return
+
+
+    space = data['_expandable']['space'].strip('/').split('/')[-1] #space path의 맨마지막 가지고 옴
     payload = {
         "id": pid,
         "type": "page",
         "title": title,
-        "version": {"number": version + 1},
-        "body": {"storage": {"value": storage_value, "representation": "storage"}}
+        "space": {"key": space},
+        # "body": {"storage": {"value": "hello world", "representation": "storage"}},
+        "body": {"storage": {"value": new_body, "representation": "storage"}},
+        "version": {"number": version + 1}
     }
-    url = f"{BASE_URL}/rest/api/content/{pid}"
-    r = requests.put(url, headers={"Content-Type": "application/json"}, auth=AUTH, data=json.dumps(payload, ensure_ascii=False))
-    if r.status_code != 200:
-        raise Exception(f"PUT failed {r.status_code}: {r.text[:500]}")
-    return r.json()
 
-# =========================
-# 메인 로직
-# =========================
-def process_page(pid: str, mapping: dict):
-    print(f"\n=== Page {pid} ===")
-    page = get_page(pid)
-    title = page["title"]
-    version = page["version"]["number"]
-    storage = page["body"]["storage"]["value"]
+    put_url = f"{BASE_URL}/rest/api/content/{pid}"
+    put_res = requests.put(put_url, json=payload, headers=headers)
+    print(f"{'✅ Updated' if put_res.status_code == 200 else '❌ Failed'}: {title}")
 
-    # 1) draw.io 첨부 처리 (선수처리 권장: 본문 링크만 바꿔도 되지만, 첨부 내부 링크가 더 중요할 때가 많음)
-    atts = list_attachments(pid)
-    updated_any_diagram = False
-    for att in atts:
-        ok, msg = process_drawio_attachment(pid, att, mapping)
-        print(f" - attachment {att.get('title') or att.get('id')} -> {msg}")
-        if ok:
-            updated_any_diagram = True
-
-    # 2) 본문 링크 치환 + 정제 후 PUT
-    new_storage = rewrite_urls_in_storage(storage, mapping)
-    new_storage = sanitize_storage_format(new_storage)
-
-    if new_storage != storage:
-        try:
-            put_page(pid, title, version, new_storage)
-            print(" - page body: updated")
-        except Exception as e:
-            print(f" - page body: PUT failed: {e}")
-    else:
-        print(" - page body: no-change")
-
-    return True
+def set_variables(mode) :
+    global BASE_URL, PAGE_ID, ORIGIN_SPACES, TARGET_SPACE
+    if mode == "TEST" :
+        BASE_URL = "https://devops-qa.martin.co.kr/confluence"
+        PAGE_ID = "1127350378"
+        ORIGIN_SPACES = ['TPG']
+        TARGET_SPACE = 'ARU'
 
 if __name__ == "__main__":
-    for pid in PAGE_IDS:
-        try:
-            process_page(pid, REWRITE_MAP)
-        except Exception as e:
-            print(f"[ERROR] page {pid}: {e}")
+#    test_short_url()
+    set_variables("TEST")
+    update_page(PAGE_ID, TESTPAGE)
+
+    # pages = get_child_pages(ROOT_PAGE_ID)
+    # print(f"🔍 Pages under root {ROOT_PAGE_ID}: {len(pages)}")
+
+    # for pid, title in pages:
+    #     update_page(pid, title)
+    #     time.sleep(0.5)
+
+    filename = 'short_urls.csv'
+    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+        fieldnames = ['old_url', 'new_url']
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for old_url, new_url in short_urls.items():
+            writer.writerow({'old_url': old_url, 'new_url': new_url})
+
+
+    print(f"\n⚠️ Short URLs written to short_urls.csv: {len(short_urls)}")
