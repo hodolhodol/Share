@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 drawio_utils.py
-- Confluence 페이지의 draw.io 첨부(확장자 유무와 무관) 내부 URL을 일괄 치환
-- 라벨(label=drawio) 또는 mediaType(application/drawio, application/vnd.jgraph.mxfile, image/svg+xml)로 판별
-- .drawio의 <diagram> payload가 base64+raw-deflate면 자동 해제/재압축
-- 본문(new_body)은 변경하지 않고 그대로 반환 (본문은 메인 코드에서 이미 처리)
+- Confluence 페이지의 draw.io 첨부(확장자 유무와 무관)를 찾아 내부 URL을 일괄 치환
+- 판별 기준: metadata.labels("drawio") 또는 metadata.mediaType(application/drawio, application/vnd.jgraph.mxfile, image/svg+xml)
+- 다운로드: 첨부 객체의 _links.download 경로를 이용(404 회피)
+- .drawio의 <diagram> payload가 base64+raw-deflate인 경우 자동 해제/재압축(원 형식 보존)
+- 본문(new_body)은 변경하지 않고 그대로 반환 (본문 치환은 메인 코드에서 처리)
 """
-from typing import List, Tuple, Optional, Callable
+
+from typing import List, Tuple, Optional, Callable, Dict, Any
 import re
 import zlib
 import base64
@@ -20,9 +22,9 @@ PLAIN_URL_PATTERN = re.compile(r'(https?://[^\s"<]+)')
 
 # ========= 공개 API (메인에서 호출) =========
 def replace_links_drawio(new_body: str,
-                         page_json: dict,
+                         page_json: Dict[str, Any],
                          BASE_URL: str,
-                         headers: dict,
+                         headers: Dict[str, str],
                          ORIGIN_SPACES: List[str],
                          TARGET_SPACE: str) -> str:
     """
@@ -39,8 +41,7 @@ def replace_links_drawio(new_body: str,
     ORIGIN_SPACES : list[str]  # 원본 공간 키들
     TARGET_SPACE : str         # 타깃 공간 키
     """
-    session = requests.Session()
-    session.headers.update(headers)
+    session = _make_session(headers)
 
     page_id = page_json.get("id")
     if not page_id:
@@ -64,7 +65,7 @@ def replace_links_drawio(new_body: str,
             continue
 
         try:
-            data, ctype = _download_attachment(session, BASE_URL, att["id"])
+            data, ctype = _download_attachment_via_link(session, BASE_URL, att)
 
             # .drawio (mxfile) 스타일
             if is_drawio_mediatype or low.endswith(".drawio") or _looks_like_mxfile(data):
@@ -89,16 +90,51 @@ def replace_links_drawio(new_body: str,
     return new_body
 
 
-# ========= 내부 유틸 (첨부/요청) =========
+# ========= 세션/네트워킹 유틸 =========
+def _make_session(headers: Dict[str, str]) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(headers or {})
+    # 간단한 재시도 설정 (과도한 재시도는 지양)
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        retry = Retry(
+            total=3, backoff_factor=0.4,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET","POST","PUT"]
+        )
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.mount("http://", HTTPAdapter(max_retries=retry))
+    except Exception:
+        pass
+    return s
+
 def _list_attachments(session: requests.Session, base_url: str, page_id: str, limit: int = 500):
     url = f"{base_url}/rest/api/content/{page_id}/child/attachment?limit={limit}&expand=metadata.labels,metadata.mediaType"
     r = session.get(url, headers={"Accept": "application/json"})
     r.raise_for_status()
     return r.json().get("results", [])
 
-def _download_attachment(session: requests.Session, base_url: str, attachment_id: str):
-    url = f"{base_url}/rest/api/content/{attachment_id}/download"
+def _download_attachment_via_link(session: requests.Session, base_url: str, att: Dict[str, Any]):
+    """
+    첨부 객체의 _links.download 를 사용해 안전하게 다운로드.
+    base_url 은 컨텍스트(/confluence, /wiki 포함)까지 들어간 값을 넘기세요.
+    """
+    links = att.get("_links", {}) or {}
+    dl_path = links.get("download")  # 예: "/download/attachments/12345/diagram?version=2&api=v2"
+    if not dl_path:
+        raise RuntimeError(f"No download link in attachment: {att.get('id')}")
+
+    url = urljoin(base_url if base_url.endswith("/") else base_url + "/", dl_path.lstrip("/"))
     r = session.get(url, allow_redirects=True)
+    if r.status_code == 404:
+        # 일부 인스턴스는 컨텍스트 경로 이슈로 루트(host) 기준이 필요한 경우가 있음
+        from urllib.parse import urlparse
+        p = urlparse(base_url)
+        host_root = f"{p.scheme}://{p.netloc}"
+        url2 = urljoin(host_root + "/", dl_path.lstrip("/"))
+        r = session.get(url2, allow_redirects=True)
+
     r.raise_for_status()
     return r.content, r.headers.get("Content-Type", "")
 
@@ -115,6 +151,23 @@ def _get_json(session: requests.Session, url: str):
     r.raise_for_status()
     return r.json()
 
+
+# ========= URL 해석/치환 =========
+def _q(s: str) -> str:
+    try:
+        return requests.utils.quote(s, safe="")
+    except Exception:
+        return s
+
+def _normalize_url(u: str, base_url: str) -> str:
+    if u.startswith("/"):
+        return urljoin(base_url, u)
+    return u
+
+def _decode_title_slug(s: str) -> str:
+    # + 또는 % 인코딩 혼재
+    return unquote_plus(s)
+
 def _find_content_by_title(session: requests.Session, base_url: str, space_key: str, title: str):
     url = f'{base_url}/rest/api/content?spaceKey={_q(space_key)}&title={_q(title)}&expand=version'
     data = _get_json(session, url)
@@ -124,23 +177,6 @@ def _find_content_by_title(session: requests.Session, base_url: str, space_key: 
 def _get_content_by_id(session: requests.Session, base_url: str, page_id: str, expand="space,title"):
     url = f"{base_url}/rest/api/content/{page_id}?expand={expand}"
     return _get_json(session, url)
-
-def _q(s: str) -> str:
-    try:
-        return requests.utils.quote(s, safe="")
-    except Exception:
-        return s
-
-
-# ========= URL 해석/치환 =========
-def _normalize_url(u: str, base_url: str) -> str:
-    if u.startswith("/"):
-        return urljoin(base_url, u)
-    return u
-
-def _decode_title_slug(s: str) -> str:
-    # + 또는 % 인코딩 혼재
-    return unquote_plus(s)
 
 def _extract_pageid_from_url(url: str, session: requests.Session, base_url: str) -> Optional[str]:
     try:
